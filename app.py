@@ -123,6 +123,15 @@ def fetch_orders(start_date, end_date):
         if not orders:
             break
 
+        if page == 1 and orders:
+            print(f"[DEBUG] Sample order keys: {list(orders[0].keys())}")
+            print(f"[DEBUG] Sample order: {orders[0]}")
+            if orders[0].get('items') or orders[0].get('order_items'):
+              items = orders[0].get('items') or orders[0].get('order_items')
+              if items:
+                print(f"[DEBUG] Sample item keys: {list(items[0].keys())}")
+                print(f"[DEBUG] Sample item: {items[0]}")
+
         all_orders.extend(orders)
         meta = data.get("meta", {}) if isinstance(data, dict) else {}
         last = int(meta.get("last_page") or meta.get("total_pages") or 1)
