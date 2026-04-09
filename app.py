@@ -1,13 +1,14 @@
 """
-app.py — Olsera Middleware untuk Keyos Financial Dashboard v5
-Strategi baru: gunakan Transaction List (inextrans) yang punya
-start_trans_date/end_trans_date dan kemungkinan ada item + profit
-
-Endpoints:
-  GET /api/dashboard?period=weekly
-  GET /api/dashboard?period=monthly
-  GET /api/status
-  GET /api/refresh
+app.py — Keyos Dashboard Middleware v6
+Strategi:
+1. Fetch Close Order List → dapat daftar order + order_id
+2. Fetch Close Order Detail per order (batch, max 100) → dapat items + cost
+3. Hitung profit dari: amount_item - total_cost
+4. Deteksi Reseller dari harga item:
+   - Premium 30ml (price < 80000) = reseller
+   - Basic 30ml (price < 65000) = reseller
+   - item_group == 'Reseller' = reseller
+5. Basket size exclude: amount=0 dan order Reseller
 """
 
 import os, requests, threading, time
@@ -64,103 +65,18 @@ def _generate_token():
         print(f"[TOKEN] Error: {e}")
     return None
 
-# ── Fetch Transaction List ────────────────────────────
-def fetch_transactions(start_date, end_date):
-    """
-    Pakai endpoint Transaction (inextrans) yang punya
-    start_trans_date/end_trans_date
-    """
-    token = get_token()
-    if not token:
-        return []
-
-    all_trans, page = [], 1
-    print(f"[TRANS] {start_date} → {end_date}")
-
-    while True:
-        headers = {
-            "Accept":        "application/json",
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {token}"
-        }
-        params = {
-            "start_trans_date": str(start_date),
-            "end_trans_date":   str(end_date),
-            "page":             page,
-            "per_page":         100
-        }
-        try:
-            r = requests.get(f"{BASE_URL_DATA}/transaction/inextrans",
-                             headers=headers, params=params, timeout=30)
-            if r.status_code == 401:
-                token = _generate_token()
-                if not token: break
-                headers["Authorization"] = f"Bearer {token}"
-                r = requests.get(f"{BASE_URL_DATA}/transaction/inextrans",
-                                 headers=headers, params=params, timeout=30)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            print(f"[TRANS] Error p{page}: {e}")
-            break
-
-        # Debug sample pertama kali
-        if page == 1:
-            print(f"[TRANS DEBUG] Response type: {type(data)}")
-            if isinstance(data, dict):
-                print(f"[TRANS DEBUG] Top keys: {list(data.keys())[:10]}")
-            if isinstance(data, list) and data:
-                print(f"[TRANS DEBUG] Sample keys: {list(data[0].keys())}")
-                print(f"[TRANS DEBUG] Sample: {data[0]}")
-            elif isinstance(data, dict):
-                for k in ['data', 'transactions', 'result', 'items']:
-                    if k in data and isinstance(data[k], list) and data[k]:
-                        sample = data[k][0]
-                        print(f"[TRANS DEBUG] data['{k}'][0] keys: {list(sample.keys())}")
-                        print(f"[TRANS DEBUG] data['{k}'][0]: {sample}")
-                        # Cek apakah ada items/detail di dalam transaksi
-                        for sub in ['items','details','order_items','products']:
-                            if sub in sample and sample[sub]:
-                                print(f"[TRANS DEBUG] Item keys: {list(sample[sub][0].keys())}")
-                                print(f"[TRANS DEBUG] Item sample: {sample[sub][0]}")
-                        break
-
-        orders = []
-        if isinstance(data, list):
-            orders = data
-        elif isinstance(data, dict):
-            for k in ['data', 'transactions', 'result', 'items']:
-                if k in data and isinstance(data[k], list):
-                    orders = data[k]
-                    break
-        if not orders:
-            print(f"[TRANS] No orders found in response")
-            break
-
-        all_trans.extend(orders)
-        meta = data.get("meta", {}) if isinstance(data, dict) else {}
-        last = int(meta.get("last_page") or meta.get("total_pages") or 1)
-        if page >= last or len(orders) < 100:
-            break
-        page += 1
-
-    print(f"[TRANS] Total: {len(all_trans)} transactions")
-    return all_trans
-
-# ── Fallback: Fetch Close Order List ─────────────────
+# ── Fetch Close Order List ────────────────────────────
 def fetch_close_orders(start_date, end_date):
-    """Fallback jika Transaction tidak tersedia"""
     token = get_token()
-    if not token:
-        return []
+    if not token: return []
 
     all_orders, page = [], 1
-    print(f"[CLOSE] {start_date} → {end_date}")
+    print(f"[LIST] {start_date} → {end_date}")
 
     while True:
         headers = {
-            "Accept":        "application/json",
-            "Content-Type":  "application/json",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
             "Authorization": f"Bearer {token}"
         }
         params = {
@@ -181,41 +97,136 @@ def fetch_close_orders(start_date, end_date):
             r.raise_for_status()
             data = r.json()
         except Exception as e:
-            print(f"[CLOSE] Error p{page}: {e}")
+            print(f"[LIST] Error p{page}: {e}")
             break
 
         orders = []
         if isinstance(data, list):
             orders = data
         elif isinstance(data, dict):
-            for k in ['data', 'orders', 'result', 'items']:
+            for k in ['data','orders','result','items']:
                 if k in data and isinstance(data[k], list):
-                    orders = data[k]
-                    break
-        if not orders:
-            break
+                    orders = data[k]; break
+        if not orders: break
 
         all_orders.extend(orders)
         meta = data.get("meta", {}) if isinstance(data, dict) else {}
         last = int(meta.get("last_page") or meta.get("total_pages") or 1)
-        if page >= last or len(orders) < 100:
-            break
+        if page >= last or len(orders) < 100: break
         page += 1
 
-    print(f"[CLOSE] {len(all_orders)} orders")
+    print(f"[LIST] {len(all_orders)} orders")
     return all_orders
 
-# ── Helpers ───────────────────────────────────────────
-def is_store2(item_name):
-    return "2nd store" in str(item_name).lower()
+# ── Fetch Close Order Detail ──────────────────────────
+def fetch_order_detail(order_id, token, headers):
+    """Ambil detail 1 order → items dengan cost"""
+    try:
+        r = requests.get(
+            f"{BASE_URL_DATA}/order/closeorder/detail",
+            headers=headers,
+            params={"id": order_id},
+            timeout=15
+        )
+        if r.status_code == 200:
+            d = r.json()
+            # Debug sample pertama
+            if not hasattr(fetch_order_detail, '_debugged'):
+                fetch_order_detail._debugged = True
+                print(f"[DETAIL DEBUG] Keys: {list(d.keys()) if isinstance(d, dict) else type(d)}")
+                detail = d.get('data', d) if isinstance(d, dict) else d
+                if isinstance(detail, dict):
+                    print(f"[DETAIL DEBUG] Detail keys: {list(detail.keys())}")
+                    items = (detail.get('items') or detail.get('order_items') or
+                             detail.get('details') or detail.get('products') or [])
+                    if items:
+                        print(f"[DETAIL DEBUG] Item keys: {list(items[0].keys())}")
+                        print(f"[DETAIL DEBUG] Item sample: {items[0]}")
+            return d.get('data', d) if isinstance(d, dict) else d
+    except Exception as e:
+        print(f"[DETAIL] Error {order_id}: {e}")
+    return None
 
-def is_reseller(item_group):
-    return str(item_group).strip().lower() == "reseller"
+def fetch_all_details(orders):
+    """
+    Fetch detail untuk semua order.
+    Pakai threading untuk mempercepat.
+    """
+    token = get_token()
+    if not token: return {}
 
-# ── Process transactions ──────────────────────────────
-def process(orders):
-    if not orders:
-        return _empty()
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+
+    details = {}
+    total = len(orders)
+    print(f"[DETAIL] Fetching details for {total} orders...")
+
+    # Fetch dengan delay kecil untuk hindari rate limit
+    for i, o in enumerate(orders):
+        oid = str(o.get('id') or o.get('order_id') or '')
+        if not oid:
+            continue
+
+        detail = fetch_order_detail(oid, token, headers)
+        if detail:
+            details[oid] = detail
+
+        # Log progress tiap 20 order
+        if (i + 1) % 20 == 0:
+            print(f"[DETAIL] Progress: {i+1}/{total}")
+
+        time.sleep(0.1)  # 100ms delay antar request
+
+    print(f"[DETAIL] Done: {len(details)}/{total} fetched")
+    return details
+
+# ── Deteksi Reseller dari harga item ──────────────────
+def detect_reseller_from_price(items, order_date=None):
+    """
+    Reseller = item dijual di bawah harga normal:
+    - Premium 30ml: harga < Rp 80.000 (berlaku semua waktu)
+      → reseller dapat potongan, harga normal retail tetap 80.000
+    - Basic 30ml: harga < Rp 65.000
+    - item_group == 'Reseller'
+
+    Catatan: walaupun ada kenaikan harga ke 89.000 sejak Feb 2026,
+    reseller tetap di bawah 80.000 sehingga threshold tidak berubah.
+    """
+    for item in items:
+        igroup = str(item.get('item_group') or item.get('category') or '').strip().lower()
+        iname  = str(item.get('item_name') or item.get('product_name') or item.get('name') or '').lower()
+        price  = float(item.get('price') or item.get('unit_price') or 0)
+
+        # Jika price tidak ada, coba hitung dari amount / qty
+        if price == 0:
+            qty   = float(item.get('qty') or item.get('quantity') or 1)
+            iamt  = float(item.get('amount') or item.get('subtotal') or 0)
+            if qty > 0 and iamt > 0:
+                price = iamt / qty
+
+        # Cek item_group Reseller
+        if igroup == 'reseller':
+            return True
+
+        # Premium 30ml reseller: harga < 80.000 (kapanpun)
+        is_basic   = 'basic' in iname
+        is_premium = not is_basic  # semua non-basic dianggap premium untuk filter ini
+
+        if is_basic and 0 < price < 65000:
+            return True
+
+        if is_premium and 0 < price < 80000:
+            return True
+
+    return False
+
+# ── Process orders ─────────────────────────────────────
+def process(orders, details_map=None):
+    if not orders: return _empty()
 
     tot_rev = tot_prof = tot_txn = 0.0
     basket_rev = basket_txn = 0.0
@@ -227,83 +238,68 @@ def process(orders):
     produk_map = {}; payment_map = {}
 
     for o in orders:
-        # Coba semua kemungkinan field name untuk tanggal
         tgl = str(
-            o.get('order_date') or o.get('trans_date') or o.get('transaction_date') or
-            o.get('created_at') or o.get('date') or ''
+            o.get('order_date') or o.get('trans_date') or
+            o.get('created_at') or ''
         )[:10]
-        if not tgl or tgl < '2020-01-01':
-            continue
+        if not tgl or tgl < '2020-01-01': continue
 
-        dt_str = str(o.get('modified_time') or o.get('order_date') or o.get('trans_date') or '')
-        hour   = int(dt_str[11:13]) if len(dt_str) >= 13 else -1
+        dt_str  = str(o.get('modified_time') or o.get('order_date') or '')
+        hour    = int(dt_str[11:13]) if len(dt_str) >= 13 else -1
+        amount  = float(o.get('total_amount') or o.get('order_amount') or 0)
+        payment = str(o.get('payment_type_name') or o.get('payment_type') or 'Lainnya').strip()
 
-        # Coba semua kemungkinan field name untuk amount
-        amount = float(
-            o.get('total_amount') or o.get('order_amount') or o.get('grand_total') or
-            o.get('amount') or o.get('total') or 0
-        )
+        oid_str = str(o.get('id') or o.get('order_id') or '')
 
-        # Profit — coba berbagai field name
-        profit = float(
-            o.get('profit') or o.get('gross_profit') or o.get('net_profit') or
-            o.get('laba') or 0
-        )
+        # Ambil item dari detail jika tersedia
+        detail  = details_map.get(oid_str) if details_map else None
+        items   = []
+        if detail:
+            items = (detail.get('items') or detail.get('order_items') or
+                     detail.get('details') or detail.get('products') or [])
 
-        # Payment
-        payment = str(
-            o.get('payment_type_name') or o.get('payment_type') or
-            o.get('payment_method') or 'Lainnya'
-        ).strip()
-
-        # Items — coba berbagai field name
-        items = (
-            o.get('items') or o.get('order_items') or o.get('details') or
-            o.get('products') or o.get('transaction_items') or []
-        )
-
-        # Tentukan store dari items
+        # Hitung profit dari items
+        order_profit     = 0.0
         order_is_s2      = False
         order_is_reseller = False
-        item_profit      = 0.0
 
         for item in items:
-            iname  = str(item.get('item_name') or item.get('product_name') or item.get('name') or '')
-            igroup = str(item.get('item_group') or item.get('category') or item.get('group') or '')
-            iqty   = float(item.get('qty') or item.get('quantity') or 0)
-            iamt   = float(item.get('amount') or item.get('subtotal') or item.get('total') or 0)
-            iprof  = float(
-                item.get('profit') or item.get('gross_profit') or
-                item.get('laba') or 0
+            iname   = str(item.get('item_name') or item.get('product_name') or item.get('name') or '')
+            igroup  = str(item.get('item_group') or item.get('category') or '')
+            iqty    = float(item.get('qty') or item.get('quantity') or 0)
+            iamt    = float(item.get('amount') or item.get('subtotal') or 0)
+            icost   = float(
+                item.get('total_cost') or item.get('cost_perunit') or
+                item.get('hpp') or item.get('cost') or 0
             )
-            icost  = float(
-                item.get('cost_price') or item.get('hpp') or item.get('cost') or
-                item.get('cost_perunit') or item.get('total_cost') or 0
-            )
+            iprofit = float(item.get('profit') or 0)
 
-            if is_store2(iname): order_is_s2 = True
-            if is_reseller(igroup): order_is_reseller = True
+            # Hitung profit jika tidak ada field profit
+            if iprofit == 0 and icost > 0 and iamt > 0:
+                iprofit = iamt - icost
+            order_profit += iprofit
 
-            # Hitung profit dari cost jika profit field kosong
-            if iprof == 0 and icost > 0 and iamt > 0:
-                iprof = iamt - icost
+            # Cek store
+            if '2nd store' in iname.lower(): order_is_s2 = True
 
-            item_profit += iprof
+            # Cek reseller dari group
+            if igroup.strip().lower() == 'reseller': order_is_reseller = True
 
-            display = iname.replace(' 2nd Store', '').replace(' 2nd store', '').strip()
+            # Product tracking
+            display = iname.replace(' 2nd Store','').replace(' 2nd store','').strip()
             if display:
                 produk_map.setdefault(display, {'item_name': display, 'qty': 0.0, 'revenue': 0.0, 'profit': 0.0})
                 produk_map[display]['qty']     += iqty
                 produk_map[display]['revenue'] += iamt
-                produk_map[display]['profit']  += iprof
+                produk_map[display]['profit']  += iprofit
 
-        # Pakai profit dari items jika profit order = 0
-        if profit == 0 and item_profit > 0:
-            profit = item_profit
+        # Fallback deteksi reseller dari harga jika ada items
+        if items and not order_is_reseller:
+            order_is_reseller = detect_reseller_from_price(items, tgl)
 
         # Totals
         tot_rev  += amount
-        tot_prof += profit
+        tot_prof += order_profit
         tot_txn  += 1
 
         # Basket size: exclude amount=0 dan Reseller
@@ -314,7 +310,7 @@ def process(orders):
         # Daily
         daily_tot.setdefault(tgl, {'tanggal': tgl, 'revenue': 0.0, 'profit': 0.0, 'transaksi': 0})
         daily_tot[tgl]['revenue']   += amount
-        daily_tot[tgl]['profit']    += profit
+        daily_tot[tgl]['profit']    += order_profit
         daily_tot[tgl]['transaksi'] += 1
 
         # Payment
@@ -323,21 +319,17 @@ def process(orders):
 
         # Store split
         if order_is_s2:
-            s2_rev  += amount; s2_prof += profit; s2_txn += 1
+            s2_rev += amount; s2_prof += order_profit; s2_txn += 1
             daily_s2.setdefault(tgl, {'tanggal': tgl, 'revenue': 0.0, 'profit': 0.0, 'transaksi': 0})
-            daily_s2[tgl]['revenue']   += amount
-            daily_s2[tgl]['profit']    += profit
-            daily_s2[tgl]['transaksi'] += 1
+            daily_s2[tgl]['revenue'] += amount; daily_s2[tgl]['profit'] += order_profit; daily_s2[tgl]['transaksi'] += 1
             if hour >= 0: hourly_s2[hour] = hourly_s2.get(hour, 0.0) + amount
         else:
-            s1_rev  += amount; s1_prof += profit; s1_txn += 1
+            s1_rev += amount; s1_prof += order_profit; s1_txn += 1
             daily_s1.setdefault(tgl, {'tanggal': tgl, 'revenue': 0.0, 'profit': 0.0, 'transaksi': 0})
-            daily_s1[tgl]['revenue']   += amount
-            daily_s1[tgl]['profit']    += profit
-            daily_s1[tgl]['transaksi'] += 1
+            daily_s1[tgl]['revenue'] += amount; daily_s1[tgl]['profit'] += order_profit; daily_s1[tgl]['transaksi'] += 1
             if hour >= 0: hourly_s1[hour] = hourly_s1.get(hour, 0.0) + amount
 
-    # ── Outputs ───────────────────────────────────────
+    # ── Build outputs ──────────────────────────────────
     daily_list = sorted(daily_tot.values(), key=lambda x: x['tanggal'])
     gpm = lambda p, r: round(p / r * 100, 1) if r else 0
 
@@ -358,13 +350,11 @@ def process(orders):
             'pct': round(others_rev / tot_rev * 100, 1) if tot_rev else 0
         })
 
-    basket_size = round(basket_rev / basket_txn, 0) if basket_txn else 0
-
     return {
         'total_revenue':   round(tot_rev, 0),
         'total_profit':    round(tot_prof, 0),
         'total_transaksi': int(tot_txn),
-        'basket_size':     basket_size,
+        'basket_size':     round(basket_rev / basket_txn, 0) if basket_txn else 0,
         'gpm_total':       gpm(tot_prof, tot_rev),
 
         'store1': {'name': 'Jl. Yos Sudarso IV', 'revenue': round(s1_rev, 0),
@@ -409,8 +399,7 @@ def pct(curr, prev):
     return round((curr - prev) / abs(prev) * 100, 1)
 
 def build_response(curr, prev):
-    if not curr:
-        return {'status': 'loading'}
+    if not curr: return {'status': 'loading'}
     result = dict(curr)
     if prev and prev.get('total_revenue', 0) > 0:
         result['growth'] = {
@@ -431,14 +420,10 @@ def make_insights(curr, growth):
     ins = []
     rev_g = growth.get('total_revenue')
     if rev_g is not None:
-        if rev_g >= 0:
-            ins.append({'type': 'positive', 'icon': 'trending_up',
-                        'title': f'Revenue naik {rev_g}%',
-                        'message': f'Total revenue tumbuh {rev_g}% dibanding periode sebelumnya.'})
-        else:
-            ins.append({'type': 'warning', 'icon': 'trending_down',
-                        'title': f'Revenue turun {abs(rev_g)}%',
-                        'message': f'Revenue turun {abs(rev_g)}% dibanding periode sebelumnya.'})
+        ins.append({'type': 'positive' if rev_g >= 0 else 'warning',
+                    'icon': 'trending_up' if rev_g >= 0 else 'trending_down',
+                    'title': f"Revenue {'naik' if rev_g >= 0 else 'turun'} {abs(rev_g)}%",
+                    'message': f"Total revenue {'tumbuh' if rev_g >= 0 else 'turun'} {abs(rev_g)}% dibanding periode sebelumnya."})
 
     if curr.get('product_mix'):
         top = curr['product_mix'][0]
@@ -462,11 +447,23 @@ def make_insights(curr, growth):
         if diff is not None and diff < -0.5:
             ins.append({'type': 'alert', 'icon': 'warning',
                         'title': f'Margin compression — {store_name}',
-                        'message': f'GPM turun {abs(diff)}pp. Review COGS.'})
+                        'message': f'GPM turun {abs(diff)}pp. Review COGS dan harga beli.'})
             break
     return ins[:4]
 
 # ── Refresh ───────────────────────────────────────────
+def refresh_period(start_date, end_date, fetch_details=True):
+    """Fetch list + detail untuk satu periode"""
+    orders = fetch_close_orders(start_date, end_date)
+    if not orders:
+        return process([])
+
+    details = {}
+    if fetch_details:
+        details = fetch_all_details(orders)
+
+    return process(orders, details)
+
 def refresh_all():
     if _cache['fetching']: return
     _cache['fetching'] = True
@@ -478,25 +475,13 @@ def refresh_all():
         ms  = today.replace(day=1);         me  = today
         pms = (ms - timedelta(days=1)).replace(day=1); pme = ms - timedelta(days=1)
 
-        print('[REFRESH] Fetching 4 periods via Transaction API...')
+        print('[REFRESH] Starting full refresh with Close Order Detail...')
 
-        # Coba Transaction endpoint dulu, fallback ke Close Order
-        cw_raw = fetch_transactions(ws,  we)
-        if not cw_raw:
-            print('[REFRESH] Transaction empty, fallback to Close Order')
-            cw_raw = fetch_close_orders(ws, we)
-
-        pw_raw = fetch_transactions(pws, pwe)
-        if not pw_raw: pw_raw = fetch_close_orders(pws, pwe)
-
-        cm_raw = fetch_transactions(ms,  me)
-        if not cm_raw: cm_raw = fetch_close_orders(ms, me)
-
-        pm_raw = fetch_transactions(pms, pme)
-        if not pm_raw: pm_raw = fetch_close_orders(pms, pme)
-
-        cw = process(cw_raw); pw = process(pw_raw)
-        cm = process(cm_raw); pm = process(pm_raw)
+        # Periode saat ini: fetch detail lengkap
+        cw = refresh_period(ws,  we,  fetch_details=True)
+        pw = refresh_period(pws, pwe, fetch_details=True)
+        cm = refresh_period(ms,  me,  fetch_details=True)
+        pm = refresh_period(pms, pme, fetch_details=True)
 
         _cache['weekly']       = build_response(cw, pw)
         _cache['monthly']      = build_response(cm, pm)
@@ -506,7 +491,9 @@ def refresh_all():
         mr = _cache['monthly'].get('total_revenue', 0)
         wb = _cache['weekly'].get('basket_size', 0)
         wg = _cache['weekly'].get('gpm_total', 0)
-        print(f'[OK] Weekly: Rp {wr:,.0f} | Monthly: Rp {mr:,.0f} | Basket: Rp {wb:,.0f} | GPM: {wg}%')
+        ws2 = _cache['weekly'].get('store2', {}).get('revenue', 0)
+        print(f'[OK] Weekly: Rp {wr:,.0f} | Monthly: Rp {mr:,.0f}')
+        print(f'     Basket: Rp {wb:,.0f} | GPM: {wg}% | Store2: Rp {ws2:,.0f}')
     except Exception as e:
         print(f'[ERROR] {e}')
         import traceback; traceback.print_exc()
@@ -526,7 +513,8 @@ def api_dashboard():
     if not data:
         if not _cache['fetching']:
             threading.Thread(target=refresh_all, daemon=True).start()
-        return jsonify({'status': 'loading', 'message': 'Mengambil data, coba lagi dalam 60 detik'}), 503
+        return jsonify({'status': 'loading',
+                        'message': 'Mengambil data, coba lagi dalam 2-3 menit'}), 503
     return jsonify(data)
 
 @app.route('/api/status')
@@ -540,29 +528,31 @@ def api_status():
         'last_updated': str(_cache['last_updated']) if _cache['last_updated'] else None,
         'basket_size':  _cache['weekly'].get('basket_size') if _cache['weekly'] else None,
         'gpm_total':    _cache['weekly'].get('gpm_total')   if _cache['weekly'] else None,
+        'store2_revenue': _cache['weekly'].get('store2', {}).get('revenue') if _cache['weekly'] else None,
     })
 
 @app.route('/api/refresh')
 def api_refresh():
     if not _cache['fetching']:
         threading.Thread(target=refresh_all, daemon=True).start()
-    return jsonify({'status': 'ok', 'message': 'Refresh dimulai (~60 detik)'})
+    return jsonify({'status': 'ok', 'message': 'Refresh dimulai (~2-3 menit karena fetch detail)'})
 
 @app.route('/')
 def index():
     w = _cache['weekly']; m = _cache['monthly']
     return jsonify({
-        'service': 'Keyos Dashboard — Olsera Middleware v5',
+        'service': 'Keyos Dashboard — Olsera Middleware v6',
         'status':  'online',
         'weekly_revenue':  f"Rp {w['total_revenue']:,.0f}" if w else 'loading',
         'weekly_basket':   f"Rp {w['basket_size']:,.0f}"   if w else 'loading',
         'weekly_gpm':      f"{w['gpm_total']}%"             if w else 'loading',
+        'store2_revenue':  f"Rp {w['store2']['revenue']:,.0f}" if w else 'loading',
         'monthly_revenue': f"Rp {m['total_revenue']:,.0f}" if m else 'loading',
     })
 
 if __name__ == '__main__':
     if APP_ID and SECRET_KEY:
-        print('🚀 Keyos Middleware v5 starting...')
+        print('🚀 Keyos Middleware v6 starting...')
         refresh_all()
         threading.Thread(target=background_loop, daemon=True).start()
     else:
