@@ -1,14 +1,22 @@
 """
-app.py — Keyos Dashboard Middleware v6
+app.py — Keyos Dashboard Middleware v7
+Field mapping CONFIRMED dari API Olsera (hasil browser test):
+
+Close Order List:
+  order_date, total_amount, payment_type_name, id
+
+Close Order Detail:
+  data.orderitems[] → {product_name, price, qty, amount, cost_price, cost_amount}
+  (NO product_group_name di level item!)
+
+Report Product Sales By SKU:
+  product_name, product_group_name ("2nd Store" = Store 2),
+  total_amount, total_profit, total_qty
+
 Strategi:
-1. Fetch Close Order List → dapat daftar order + order_id
-2. Fetch Close Order Detail per order (batch, max 100) → dapat items + cost
-3. Hitung profit dari: amount_item - total_cost
-4. Deteksi Reseller dari harga item:
-   - Premium 30ml (price < 80000) = reseller
-   - Basic 30ml (price < 65000) = reseller
-   - item_group == 'Reseller' = reseller
-5. Basket size exclude: amount=0 dan order Reseller
+1. Close Order List → revenue, transaksi harian, hourly, payment
+2. Report SKU (from/to) → profit per produk, product mix, store split by group
+3. Close Order Detail (sample) → deteksi reseller via price threshold
 """
 
 import os, requests, threading, time
@@ -65,51 +73,34 @@ def _generate_token():
         print(f"[TOKEN] Error: {e}")
     return None
 
-# ── Fetch Close Order List ────────────────────────────
-def fetch_close_orders(start_date, end_date):
-    token = get_token()
-    if not token: return []
+def _headers():
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {get_token()}"
+    }
 
+# ── 1. Fetch Close Order List ─────────────────────────
+def fetch_close_orders(start_date, end_date):
     all_orders, page = [], 1
     print(f"[LIST] {start_date} → {end_date}")
-
     while True:
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}"
-        }
-        params = {
-            "start_date": str(start_date),
-            "end_date":   str(end_date),
-            "page":       page,
-            "per_page":   100
-        }
         try:
             r = requests.get(f"{BASE_URL_DATA}/order/closeorder",
-                             headers=headers, params=params, timeout=30)
-            if r.status_code == 401:
-                token = _generate_token()
-                if not token: break
-                headers["Authorization"] = f"Bearer {token}"
-                r = requests.get(f"{BASE_URL_DATA}/order/closeorder",
-                                 headers=headers, params=params, timeout=30)
+                headers=_headers(),
+                params={"start_date": str(start_date), "end_date": str(end_date),
+                        "page": page, "per_page": 100},
+                timeout=30)
             r.raise_for_status()
             data = r.json()
         except Exception as e:
-            print(f"[LIST] Error p{page}: {e}")
-            break
+            print(f"[LIST] Error p{page}: {e}"); break
 
-        orders = []
-        if isinstance(data, list):
-            orders = data
-        elif isinstance(data, dict):
-            for k in ['data','orders','result','items']:
-                if k in data and isinstance(data[k], list):
-                    orders = data[k]; break
+        orders = data if isinstance(data, list) else next(
+            (data[k] for k in ['data','orders','result','items'] if isinstance(data.get(k), list)), [])
         if not orders: break
-
         all_orders.extend(orders)
+
         meta = data.get("meta", {}) if isinstance(data, dict) else {}
         last = int(meta.get("last_page") or meta.get("total_pages") or 1)
         if page >= last or len(orders) < 100: break
@@ -118,265 +109,240 @@ def fetch_close_orders(start_date, end_date):
     print(f"[LIST] {len(all_orders)} orders")
     return all_orders
 
-# ── Fetch Close Order Detail ──────────────────────────
-def fetch_order_detail(order_id, token, headers):
-    """Ambil detail 1 order → items dengan cost"""
+# ── 2. Fetch Report SKU (profit + product mix) ────────
+def fetch_report_sku(start_date, end_date):
+    """
+    Endpoint: /report/productsalesbysku
+    Params: from, to, per_page, page
+    Returns: product_name, product_group_name, total_amount, total_profit, total_qty
+    """
+    all_items, page = [], 1
+    print(f"[SKU] {start_date} → {end_date}")
+    while True:
+        try:
+            r = requests.get(f"{BASE_URL_DATA}/report/productsalesbysku",
+                headers=_headers(),
+                params={"from": str(start_date), "to": str(end_date),
+                        "page": page, "per_page": 100},
+                timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"[SKU] Error p{page}: {e}"); break
+
+        items = data.get('data', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        if not items: break
+        all_items.extend(items)
+
+        meta = data.get("meta", {}) if isinstance(data, dict) else {}
+        last = int(meta.get("last_page") or meta.get("total_pages") or 1)
+        if page >= last or len(items) < 100: break
+        page += 1
+
+    print(f"[SKU] {len(all_items)} produk")
+    return all_items
+
+# ── 3. Fetch Close Order Detail (untuk reseller check) ─
+def fetch_order_detail(order_id):
     try:
-        r = requests.get(
-            f"{BASE_URL_DATA}/order/closeorder/detail",
-            headers=headers,
-            params={"id": order_id},
-            timeout=15
-        )
+        r = requests.get(f"{BASE_URL_DATA}/order/closeorder/detail",
+            headers=_headers(), params={"id": order_id}, timeout=15)
         if r.status_code == 200:
             d = r.json()
-            # Debug sample pertama
-            if not hasattr(fetch_order_detail, '_debugged'):
-                fetch_order_detail._debugged = True
-                print(f"[DETAIL DEBUG] Keys: {list(d.keys()) if isinstance(d, dict) else type(d)}")
-                detail = d.get('data', d) if isinstance(d, dict) else d
-                if isinstance(detail, dict):
-                    print(f"[DETAIL DEBUG] Detail keys: {list(detail.keys())}")
-                    items = (detail.get('items') or detail.get('order_items') or
-                             detail.get('details') or detail.get('products') or [])
-                    if items:
-                        print(f"[DETAIL DEBUG] Item keys: {list(items[0].keys())}")
-                        print(f"[DETAIL DEBUG] Item sample: {items[0]}")
-            return d.get('data', d) if isinstance(d, dict) else d
+            return d.get('data', d)
     except Exception as e:
         print(f"[DETAIL] Error {order_id}: {e}")
     return None
 
-def fetch_all_details(orders):
+def is_reseller_order(order_id):
     """
-    Fetch detail untuk semua order.
-    Pakai threading untuk mempercepat.
+    Ambil detail order, cek apakah ada item dengan harga di bawah threshold reseller:
+    - harga < 80.000 = reseller (semua produk, kapanpun)
+    - kecuali Basic 30ml yang memang 65.000
     """
-    token = get_token()
-    if not token: return {}
-
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-
-    details = {}
-    total = len(orders)
-    print(f"[DETAIL] Fetching details for {total} orders...")
-
-    # Fetch dengan delay kecil untuk hindari rate limit
-    for i, o in enumerate(orders):
-        oid = str(o.get('id') or o.get('order_id') or '')
-        if not oid:
-            continue
-
-        detail = fetch_order_detail(oid, token, headers)
-        if detail:
-            details[oid] = detail
-
-        # Log progress tiap 20 order
-        if (i + 1) % 20 == 0:
-            print(f"[DETAIL] Progress: {i+1}/{total}")
-
-        time.sleep(0.1)  # 100ms delay antar request
-
-    print(f"[DETAIL] Done: {len(details)}/{total} fetched")
-    return details
-
-# ── Deteksi Reseller dari harga item ──────────────────
-def detect_reseller_from_price(items, order_date=None):
-    """
-    Reseller = item dijual di bawah harga normal:
-    - Premium 30ml: harga < Rp 80.000 (berlaku semua waktu)
-      → reseller dapat potongan, harga normal retail tetap 80.000
-    - Basic 30ml: harga < Rp 65.000
-    - item_group == 'Reseller'
-
-    Catatan: walaupun ada kenaikan harga ke 89.000 sejak Feb 2026,
-    reseller tetap di bawah 80.000 sehingga threshold tidak berubah.
-    """
+    detail = fetch_order_detail(order_id)
+    if not detail:
+        return False
+    items = detail.get('orderitems', [])
     for item in items:
-        igroup = str(item.get('item_group') or item.get('category') or '').strip().lower()
-        iname  = str(item.get('item_name') or item.get('product_name') or item.get('name') or '').lower()
-        price  = float(item.get('price') or item.get('unit_price') or 0)
-
-        # Jika price tidak ada, coba hitung dari amount / qty
-        if price == 0:
-            qty   = float(item.get('qty') or item.get('quantity') or 1)
-            iamt  = float(item.get('amount') or item.get('subtotal') or 0)
-            if qty > 0 and iamt > 0:
-                price = iamt / qty
-
-        # Cek item_group Reseller
-        if igroup == 'reseller':
-            return True
-
-        # Premium 30ml reseller: harga < 80.000 (kapanpun)
-        is_basic   = 'basic' in iname
-        is_premium = not is_basic  # semua non-basic dianggap premium untuk filter ini
-
+        price = float(item.get('price') or 0)
+        iname = str(item.get('product_name') or '').lower()
+        is_basic = 'basic' in iname
         if is_basic and 0 < price < 65000:
             return True
-
-        if is_premium and 0 < price < 80000:
+        if not is_basic and 0 < price < 80000:
             return True
-
     return False
 
-# ── Process orders ─────────────────────────────────────
-def process(orders, details_map=None):
-    if not orders: return _empty()
+# ── Process data ──────────────────────────────────────
+def process(orders, sku_items):
+    if not orders:
+        return _empty()
 
-    tot_rev = tot_prof = tot_txn = 0.0
+    # ── Build store split dari SKU report ─────────────
+    # product_group_name == "2nd Store" → Store 2
+    s2_products = set()
+    sku_revenue = {}    # product_name → {revenue, profit, qty, is_s2}
+    tot_sku_rev  = 0.0
+    tot_sku_prof = 0.0
+    s1_rev_sku = s1_prof_sku = 0.0
+    s2_rev_sku = s2_prof_sku = 0.0
+
+    for item in sku_items:
+        pname  = str(item.get('product_name') or 'Unknown')
+        pgroup = str(item.get('product_group_name') or '')
+        irev   = float(item.get('total_amount') or 0)
+        iprof  = float(item.get('total_profit') or 0)
+        iqty   = float(item.get('total_qty') or 0)
+        is_s2  = pgroup.strip().lower() == '2nd store' or '2nd store' in pname.lower()
+
+        # Nama display bersih
+        display = pname.replace(' 2nd Store', '').replace(' 2nd store', '').strip()
+
+        sku_revenue.setdefault(display, {'revenue': 0.0, 'profit': 0.0, 'qty': 0.0, 'is_s2': is_s2})
+        sku_revenue[display]['revenue'] += irev
+        sku_revenue[display]['profit']  += iprof
+        sku_revenue[display]['qty']     += iqty
+
+        tot_sku_rev  += irev
+        tot_sku_prof += iprof
+        if is_s2:
+            s2_rev_sku  += irev
+            s2_prof_sku += iprof
+            s2_products.add(display)
+        else:
+            s1_rev_sku  += irev
+            s1_prof_sku += iprof
+
+    # ── Process order list untuk transaksi, daily, hourly ─
+    tot_rev = tot_txn = 0.0
     basket_rev = basket_txn = 0.0
-    s1_rev = s1_prof = s1_txn = 0.0
-    s2_rev = s2_prof = s2_txn = 0.0
-
+    s1_txn = s2_txn = 0.0
     daily_tot = {}; daily_s1 = {}; daily_s2 = {}
     hourly_s1 = {}; hourly_s2 = {}
-    produk_map = {}; payment_map = {}
+    payment_map = {}
+
+    # Batch check reseller: sample 20 order terkecil (kemungkinan reseller)
+    sorted_small = sorted(orders, key=lambda x: float(x.get('total_amount') or 0))[:20]
+    reseller_ids = set()
+    for o in sorted_small:
+        oid = str(o.get('id') or '')
+        amt = float(o.get('total_amount') or 0)
+        # Hanya cek detail untuk order dengan amount rendah (kemungkinan reseller)
+        if 0 < amt < 80000 and oid:
+            if is_reseller_order(oid):
+                reseller_ids.add(oid)
+            time.sleep(0.05)
+
+    print(f"[RESELLER] Detected {len(reseller_ids)} reseller orders from sample")
 
     for o in orders:
-        tgl = str(
-            o.get('order_date') or o.get('trans_date') or
-            o.get('created_at') or ''
-        )[:10]
+        tgl = str(o.get('order_date') or o.get('created_at') or '')[:10]
         if not tgl or tgl < '2020-01-01': continue
 
-        dt_str  = str(o.get('modified_time') or o.get('order_date') or '')
+        dt_str  = str(o.get('order_time') or o.get('modified_time') or o.get('order_date') or '')
         hour    = int(dt_str[11:13]) if len(dt_str) >= 13 else -1
         amount  = float(o.get('total_amount') or o.get('order_amount') or 0)
         payment = str(o.get('payment_type_name') or o.get('payment_type') or 'Lainnya').strip()
+        oid     = str(o.get('id') or '')
 
-        oid_str = str(o.get('id') or o.get('order_id') or '')
+        # Tentukan store: gunakan rasio dari SKU report
+        # Jika SKU data tersedia, s2 adalah proporsi s2_rev/tot dari SKU
+        # Untuk transaksi individual: heuristik amount, untuk sekarang default s1
+        # (store split revenue lebih akurat dari SKU report)
+        is_reseller = oid in reseller_ids
 
-        # Ambil item dari detail jika tersedia
-        detail  = details_map.get(oid_str) if details_map else None
-        items   = []
-        if detail:
-            items = (detail.get('items') or detail.get('order_items') or
-                     detail.get('details') or detail.get('products') or [])
+        tot_rev += amount
+        tot_txn += 1
 
-        # Hitung profit dari items
-        order_profit     = 0.0
-        order_is_s2      = False
-        order_is_reseller = False
-
-        for item in items:
-            iname   = str(item.get('item_name') or item.get('product_name') or item.get('name') or '')
-            igroup  = str(item.get('item_group') or item.get('category') or '')
-            iqty    = float(item.get('qty') or item.get('quantity') or 0)
-            iamt    = float(item.get('amount') or item.get('subtotal') or 0)
-            icost   = float(
-                item.get('total_cost') or item.get('cost_perunit') or
-                item.get('hpp') or item.get('cost') or 0
-            )
-            iprofit = float(item.get('profit') or 0)
-
-            # Hitung profit jika tidak ada field profit
-            if iprofit == 0 and icost > 0 and iamt > 0:
-                iprofit = iamt - icost
-            order_profit += iprofit
-
-            # Cek store
-            if '2nd store' in iname.lower(): order_is_s2 = True
-
-            # Cek reseller dari group
-            if igroup.strip().lower() == 'reseller': order_is_reseller = True
-
-            # Product tracking
-            display = iname.replace(' 2nd Store','').replace(' 2nd store','').strip()
-            if display:
-                produk_map.setdefault(display, {'item_name': display, 'qty': 0.0, 'revenue': 0.0, 'profit': 0.0})
-                produk_map[display]['qty']     += iqty
-                produk_map[display]['revenue'] += iamt
-                produk_map[display]['profit']  += iprofit
-
-        # Fallback deteksi reseller dari harga jika ada items
-        if items and not order_is_reseller:
-            order_is_reseller = detect_reseller_from_price(items, tgl)
-
-        # Totals
-        tot_rev  += amount
-        tot_prof += order_profit
-        tot_txn  += 1
-
-        # Basket size: exclude amount=0 dan Reseller
-        if amount > 0 and not order_is_reseller:
+        if amount > 0 and not is_reseller:
             basket_rev += amount
             basket_txn += 1
 
-        # Daily
+        # Daily total
         daily_tot.setdefault(tgl, {'tanggal': tgl, 'revenue': 0.0, 'profit': 0.0, 'transaksi': 0})
         daily_tot[tgl]['revenue']   += amount
-        daily_tot[tgl]['profit']    += order_profit
         daily_tot[tgl]['transaksi'] += 1
 
         # Payment
         payment_map.setdefault(payment, {'payment_type': payment, 'amount': 0.0})
         payment_map[payment]['amount'] += amount
 
-        # Store split
-        if order_is_s2:
-            s2_rev += amount; s2_prof += order_profit; s2_txn += 1
-            daily_s2.setdefault(tgl, {'tanggal': tgl, 'revenue': 0.0, 'profit': 0.0, 'transaksi': 0})
-            daily_s2[tgl]['revenue'] += amount; daily_s2[tgl]['profit'] += order_profit; daily_s2[tgl]['transaksi'] += 1
-            if hour >= 0: hourly_s2[hour] = hourly_s2.get(hour, 0.0) + amount
-        else:
-            s1_rev += amount; s1_prof += order_profit; s1_txn += 1
-            daily_s1.setdefault(tgl, {'tanggal': tgl, 'revenue': 0.0, 'profit': 0.0, 'transaksi': 0})
-            daily_s1[tgl]['revenue'] += amount; daily_s1[tgl]['profit'] += order_profit; daily_s1[tgl]['transaksi'] += 1
-            if hour >= 0: hourly_s1[hour] = hourly_s1.get(hour, 0.0) + amount
+        # Hourly — split proportional berdasarkan ratio SKU
+        s2_ratio = s2_rev_sku / tot_sku_rev if tot_sku_rev > 0 else 0
+        if hour >= 0:
+            hourly_s1[hour] = hourly_s1.get(hour, 0.0) + amount * (1 - s2_ratio)
+            hourly_s2[hour] = hourly_s2.get(hour, 0.0) + amount * s2_ratio
 
-    # ── Build outputs ──────────────────────────────────
-    daily_list = sorted(daily_tot.values(), key=lambda x: x['tanggal'])
-    gpm = lambda p, r: round(p / r * 100, 1) if r else 0
+    # ── Revenue per store dari SKU report (lebih akurat) ─
+    # Scale ke total revenue order jika SKU tidak cover semua
+    scale = tot_rev / tot_sku_rev if tot_sku_rev > 0 else 1
 
-    def hourly(hm):
-        return [{'hour': f'{h:02d}:00', 'revenue': round(hm.get(h, 0), 0)} for h in range(8, 23)]
+    # ── Daily store split (proportional) ─────────────
+    s2_ratio_daily = s2_rev_sku / tot_sku_rev if tot_sku_rev > 0 else 0
+    for tgl, d in daily_tot.items():
+        s1_rev_d = d['revenue'] * (1 - s2_ratio_daily)
+        s2_rev_d = d['revenue'] * s2_ratio_daily
+        daily_s1[tgl] = {'tanggal': tgl, 'revenue': round(s1_rev_d, 0), 'transaksi': 0}
+        daily_s2[tgl] = {'tanggal': tgl, 'revenue': round(s2_rev_d, 0), 'transaksi': 0}
 
-    mix_sorted  = sorted(produk_map.values(), key=lambda x: x['revenue'], reverse=True)
-    top4        = mix_sorted[:4]
-    others_rev  = sum(v['revenue'] for v in mix_sorted[4:])
+    # ── Product mix ────────────────────────────────────
+    mix_sorted  = sorted(sku_revenue.values(), key=lambda x: x['revenue'], reverse=True)
+    top4        = sorted(sku_revenue.items(), key=lambda x: x[1]['revenue'], reverse=True)[:4]
+    others_rev  = sum(v['revenue'] for k, v in sorted(sku_revenue.items(),
+                      key=lambda x: x[1]['revenue'], reverse=True)[4:])
     product_mix = [
-        {'name': p['item_name'], 'revenue': round(p['revenue'], 0),
-         'pct': round(p['revenue'] / tot_rev * 100, 1) if tot_rev else 0}
-        for p in top4
+        {'name': k, 'revenue': round(v['revenue'], 0),
+         'pct': round(v['revenue'] / tot_sku_rev * 100, 1) if tot_sku_rev else 0}
+        for k, v in top4
     ]
     if others_rev > 0:
-        product_mix.append({
-            'name': 'Others', 'revenue': round(others_rev, 0),
-            'pct': round(others_rev / tot_rev * 100, 1) if tot_rev else 0
-        })
+        product_mix.append({'name': 'Others', 'revenue': round(others_rev, 0),
+                            'pct': round(others_rev / tot_sku_rev * 100, 1) if tot_sku_rev else 0})
+
+    gpm = lambda p, r: round(p / r * 100, 1) if r else 0
+
+    def hourly_list(hm):
+        return [{'hour': f'{h:02d}:00', 'revenue': round(hm.get(h, 0), 0)} for h in range(8, 23)]
+
+    basket_size = round(basket_rev / basket_txn, 0) if basket_txn else 0
+
+    # Revenue store menggunakan SKU report (paling akurat) di-scale ke total order
+    s1_rev_final  = s1_rev_sku * scale
+    s2_rev_final  = s2_rev_sku * scale
+    s1_prof_final = s1_prof_sku * scale
+    s2_prof_final = s2_prof_sku * scale
 
     return {
         'total_revenue':   round(tot_rev, 0),
-        'total_profit':    round(tot_prof, 0),
+        'total_profit':    round(tot_sku_prof * scale, 0),
         'total_transaksi': int(tot_txn),
-        'basket_size':     round(basket_rev / basket_txn, 0) if basket_txn else 0,
-        'gpm_total':       gpm(tot_prof, tot_rev),
+        'basket_size':     basket_size,
+        'gpm_total':       gpm(tot_sku_prof, tot_sku_rev),
 
-        'store1': {'name': 'Jl. Yos Sudarso IV', 'revenue': round(s1_rev, 0),
-                   'profit': round(s1_prof, 0), 'transaksi': int(s1_txn), 'gpm': gpm(s1_prof, s1_rev)},
-        'store2': {'name': 'Jl. Diponegoro',      'revenue': round(s2_rev, 0),
-                   'profit': round(s2_prof, 0), 'transaksi': int(s2_txn), 'gpm': gpm(s2_prof, s2_rev)},
+        'store1': {'name': 'Jl. Yos Sudarso IV',
+                   'revenue': round(s1_rev_final, 0), 'profit': round(s1_prof_final, 0),
+                   'transaksi': int(tot_txn - int(s2_txn)), 'gpm': gpm(s1_prof_sku, s1_rev_sku)},
+        'store2': {'name': 'Jl. Diponegoro',
+                   'revenue': round(s2_rev_final, 0), 'profit': round(s2_prof_final, 0),
+                   'transaksi': int(s2_txn), 'gpm': gpm(s2_prof_sku, s2_rev_sku)},
 
-        'daily_total':   [dict(d, revenue=round(d['revenue'],0), profit=round(d['profit'],0)) for d in daily_list],
+        'daily_total':   sorted([dict(d, revenue=round(d['revenue'],0)) for d in daily_tot.values()],
+                                key=lambda x: x['tanggal']),
         'daily_store1':  sorted(daily_s1.values(), key=lambda x: x['tanggal']),
         'daily_store2':  sorted(daily_s2.values(), key=lambda x: x['tanggal']),
-        'hourly_store1': hourly(hourly_s1),
-        'hourly_store2': hourly(hourly_s2),
+        'hourly_store1': hourly_list(hourly_s1),
+        'hourly_store2': hourly_list(hourly_s2),
 
         'product_mix':  product_mix,
         'top_products': [
-            {'item_name': p['item_name'], 'qty': round(p['qty'],0),
-             'revenue': round(p['revenue'],0), 'profit': round(p['profit'],0),
-             'margin_pct': gpm(p['profit'], p['revenue'])}
-            for p in mix_sorted[:10]
+            {'item_name': k, 'qty': round(v['qty'],0), 'revenue': round(v['revenue'],0),
+             'profit': round(v['profit'],0), 'margin_pct': gpm(v['profit'], v['revenue']),
+             'store': '2' if v['is_s2'] else '1'}
+            for k, v in sorted(sku_revenue.items(), key=lambda x: x[1]['revenue'], reverse=True)[:10]
         ],
         'payment':    sorted(payment_map.values(), key=lambda x: x['amount'], reverse=True)[:6],
-        'days_count': len(daily_list),
+        'days_count': len(daily_tot),
         'last_updated': datetime.now().strftime('%d %b %Y, %H:%M WIB'),
     }
 
@@ -423,14 +389,12 @@ def make_insights(curr, growth):
         ins.append({'type': 'positive' if rev_g >= 0 else 'warning',
                     'icon': 'trending_up' if rev_g >= 0 else 'trending_down',
                     'title': f"Revenue {'naik' if rev_g >= 0 else 'turun'} {abs(rev_g)}%",
-                    'message': f"Total revenue {'tumbuh' if rev_g >= 0 else 'turun'} {abs(rev_g)}% dibanding periode sebelumnya."})
-
+                    'message': f"Total revenue {'tumbuh' if rev_g >= 0 else 'turun'} {abs(rev_g)}% vs periode sebelumnya."})
     if curr.get('product_mix'):
         top = curr['product_mix'][0]
         ins.append({'type': 'info', 'icon': 'star',
                     'title': f"Top product: {top['name']}",
                     'message': f"{top['name']} berkontribusi {top['pct']}% dari total revenue."})
-
     s1g = growth.get('store1_revenue'); s2g = growth.get('store2_revenue')
     if s1g is not None and s2g is not None:
         if s2g > s1g and s2g > 0:
@@ -441,28 +405,18 @@ def make_insights(curr, growth):
             ins.append({'type': 'positive', 'icon': 'flash',
                         'title': 'Store 1 leading',
                         'message': f'Jl. Yos Sudarso tumbuh {s1g}% periode ini.'})
-
-    for store_name, diff_key in [('Store 1','gpm_s1_pp'),('Store 2','gpm_s2_pp')]:
-        diff = growth.get(diff_key)
-        if diff is not None and diff < -0.5:
-            ins.append({'type': 'alert', 'icon': 'warning',
-                        'title': f'Margin compression — {store_name}',
-                        'message': f'GPM turun {abs(diff)}pp. Review COGS dan harga beli.'})
-            break
+    gpm_diff = growth.get('gpm_s1_pp') or growth.get('gpm_s2_pp')
+    if gpm_diff is not None and gpm_diff < -0.5:
+        ins.append({'type': 'alert', 'icon': 'warning',
+                    'title': 'Margin compression terdeteksi',
+                    'message': f'GPM turun {abs(gpm_diff)}pp. Review COGS dan harga beli.'})
     return ins[:4]
 
 # ── Refresh ───────────────────────────────────────────
-def refresh_period(start_date, end_date, fetch_details=True):
-    """Fetch list + detail untuk satu periode"""
-    orders = fetch_close_orders(start_date, end_date)
-    if not orders:
-        return process([])
-
-    details = {}
-    if fetch_details:
-        details = fetch_all_details(orders)
-
-    return process(orders, details)
+def refresh_period(start_date, end_date):
+    orders   = fetch_close_orders(start_date, end_date)
+    sku      = fetch_report_sku(start_date, end_date)
+    return process(orders, sku)
 
 def refresh_all():
     if _cache['fetching']: return
@@ -475,22 +429,20 @@ def refresh_all():
         ms  = today.replace(day=1);         me  = today
         pms = (ms - timedelta(days=1)).replace(day=1); pme = ms - timedelta(days=1)
 
-        print('[REFRESH] Starting full refresh with Close Order Detail...')
-
-        # Periode saat ini: fetch detail lengkap
-        cw = refresh_period(ws,  we,  fetch_details=True)
-        pw = refresh_period(pws, pwe, fetch_details=True)
-        cm = refresh_period(ms,  me,  fetch_details=True)
-        pm = refresh_period(pms, pme, fetch_details=True)
+        print('[REFRESH] Starting v7 refresh...')
+        cw = refresh_period(ws,  we)
+        pw = refresh_period(pws, pwe)
+        cm = refresh_period(ms,  me)
+        pm = refresh_period(pms, pme)
 
         _cache['weekly']       = build_response(cw, pw)
         _cache['monthly']      = build_response(cm, pm)
         _cache['last_updated'] = datetime.now()
 
-        wr = _cache['weekly'].get('total_revenue', 0)
-        mr = _cache['monthly'].get('total_revenue', 0)
-        wb = _cache['weekly'].get('basket_size', 0)
-        wg = _cache['weekly'].get('gpm_total', 0)
+        wr  = _cache['weekly'].get('total_revenue', 0)
+        mr  = _cache['monthly'].get('total_revenue', 0)
+        wb  = _cache['weekly'].get('basket_size', 0)
+        wg  = _cache['weekly'].get('gpm_total', 0)
         ws2 = _cache['weekly'].get('store2', {}).get('revenue', 0)
         print(f'[OK] Weekly: Rp {wr:,.0f} | Monthly: Rp {mr:,.0f}')
         print(f'     Basket: Rp {wb:,.0f} | GPM: {wg}% | Store2: Rp {ws2:,.0f}')
@@ -513,21 +465,20 @@ def api_dashboard():
     if not data:
         if not _cache['fetching']:
             threading.Thread(target=refresh_all, daemon=True).start()
-        return jsonify({'status': 'loading',
-                        'message': 'Mengambil data, coba lagi dalam 2-3 menit'}), 503
+        return jsonify({'status': 'loading', 'message': 'Mengambil data, coba lagi dalam 60 detik'}), 503
     return jsonify(data)
 
 @app.route('/api/status')
 def api_status():
     return jsonify({
-        'status':       'online',
-        'has_weekly':   _cache['weekly']  is not None,
-        'has_monthly':  _cache['monthly'] is not None,
-        'fetching':     _cache['fetching'],
-        'config_ok':    bool(APP_ID and SECRET_KEY),
-        'last_updated': str(_cache['last_updated']) if _cache['last_updated'] else None,
-        'basket_size':  _cache['weekly'].get('basket_size') if _cache['weekly'] else None,
-        'gpm_total':    _cache['weekly'].get('gpm_total')   if _cache['weekly'] else None,
+        'status':         'online',
+        'has_weekly':     _cache['weekly']  is not None,
+        'has_monthly':    _cache['monthly'] is not None,
+        'fetching':       _cache['fetching'],
+        'config_ok':      bool(APP_ID and SECRET_KEY),
+        'last_updated':   str(_cache['last_updated']) if _cache['last_updated'] else None,
+        'basket_size':    _cache['weekly'].get('basket_size')             if _cache['weekly'] else None,
+        'gpm_total':      _cache['weekly'].get('gpm_total')               if _cache['weekly'] else None,
         'store2_revenue': _cache['weekly'].get('store2', {}).get('revenue') if _cache['weekly'] else None,
     })
 
@@ -535,13 +486,13 @@ def api_status():
 def api_refresh():
     if not _cache['fetching']:
         threading.Thread(target=refresh_all, daemon=True).start()
-    return jsonify({'status': 'ok', 'message': 'Refresh dimulai (~2-3 menit karena fetch detail)'})
+    return jsonify({'status': 'ok', 'message': 'Refresh dimulai (~60 detik)'})
 
 @app.route('/')
 def index():
     w = _cache['weekly']; m = _cache['monthly']
     return jsonify({
-        'service': 'Keyos Dashboard — Olsera Middleware v6',
+        'service': 'Keyos Dashboard — Olsera Middleware v7',
         'status':  'online',
         'weekly_revenue':  f"Rp {w['total_revenue']:,.0f}" if w else 'loading',
         'weekly_basket':   f"Rp {w['basket_size']:,.0f}"   if w else 'loading',
@@ -552,7 +503,7 @@ def index():
 
 if __name__ == '__main__':
     if APP_ID and SECRET_KEY:
-        print('🚀 Keyos Middleware v6 starting...')
+        print('🚀 Keyos Middleware v7 starting...')
         refresh_all()
         threading.Thread(target=background_loop, daemon=True).start()
     else:
