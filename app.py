@@ -82,13 +82,13 @@ def fetch_orders(start_date, end_date):
         params  = {"start_date": str(start_date), "end_date": str(end_date),
                    "page": page, "per_page": 100}
         try:
-            r = requests.get(f"{BASE_URL_DATA}/order/closeorder/list",
+            r = requests.get(f"{BASE_URL_DATA}/order/closeorder",
                              headers=headers, params=params, timeout=30)
             if r.status_code == 401:
                 token = _generate_token()
                 if not token: break
                 headers["Authorization"] = f"Bearer {token}"
-                r = requests.get(f"{BASE_URL_DATA}/order/closeorder/list",
+                r = requests.get(f"{BASE_URL_DATA}/order/closeorder",
                                  headers=headers, params=params, timeout=30)
             r.raise_for_status()
             data = r.json()
