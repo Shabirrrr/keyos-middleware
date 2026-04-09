@@ -214,27 +214,33 @@ def process(orders, sku_items):
             s1_rev_sku  += irev
             s1_prof_sku += iprof
 
+    # ── Hitung basket size dari SKU report (paling akurat) ──
+    # Basket size = avg harga per botol untuk penjualan retail
+    # Exclude: group "Reseller", amount=0 (bonus/kemasan), qty=0
+    # Basket size dari close order list:
+    # Exclude: amount = 0 (redeem/bonus)
+    # Exclude: amount > 650.000 (bulk order > 10 pcs, dianggap reseller)
+    # Threshold 650.000 = 10 botol x harga terendah 65.000
+    BULK_THRESHOLD = 800000
+    basket_rev_orders = 0.0
+    basket_txn_orders = 0
+
+    for o in orders:
+        amt = float(o.get('total_amount') or 0)
+        if amt <= 0: continue          # exclude amount = 0
+        if amt > BULK_THRESHOLD: continue  # exclude bulk reseller > 10 pcs
+        basket_rev_orders += amt
+        basket_txn_orders += 1
+
+    basket_size_sku = round(basket_rev_orders / basket_txn_orders, 0) if basket_txn_orders > 0 else 0
+    print(f"[BASKET] Valid orders: {basket_txn_orders} | Basket/order: Rp {basket_size_sku:,.0f}")
+
     # ── Process order list untuk transaksi, daily, hourly ─
     tot_rev = tot_txn = 0.0
-    basket_rev = basket_txn = 0.0
     s1_txn = s2_txn = 0.0
     daily_tot = {}; daily_s1 = {}; daily_s2 = {}
     hourly_s1 = {}; hourly_s2 = {}
     payment_map = {}
-
-    # Batch check reseller: sample 20 order terkecil (kemungkinan reseller)
-    sorted_small = sorted(orders, key=lambda x: float(x.get('total_amount') or 0))[:20]
-    reseller_ids = set()
-    for o in sorted_small:
-        oid = str(o.get('id') or '')
-        amt = float(o.get('total_amount') or 0)
-        # Hanya cek detail untuk order dengan amount rendah (kemungkinan reseller)
-        if 0 < amt < 80000 and oid:
-            if is_reseller_order(oid):
-                reseller_ids.add(oid)
-            time.sleep(0.05)
-
-    print(f"[RESELLER] Detected {len(reseller_ids)} reseller orders from sample")
 
     for o in orders:
         tgl = str(o.get('order_date') or o.get('created_at') or '')[:10]
@@ -244,20 +250,9 @@ def process(orders, sku_items):
         hour    = int(dt_str[11:13]) if len(dt_str) >= 13 else -1
         amount  = float(o.get('total_amount') or o.get('order_amount') or 0)
         payment = str(o.get('payment_type_name') or o.get('payment_type') or 'Lainnya').strip()
-        oid     = str(o.get('id') or '')
-
-        # Tentukan store: gunakan rasio dari SKU report
-        # Jika SKU data tersedia, s2 adalah proporsi s2_rev/tot dari SKU
-        # Untuk transaksi individual: heuristik amount, untuk sekarang default s1
-        # (store split revenue lebih akurat dari SKU report)
-        is_reseller = oid in reseller_ids
 
         tot_rev += amount
         tot_txn += 1
-
-        if amount > 0 and not is_reseller:
-            basket_rev += amount
-            basket_txn += 1
 
         # Daily total
         daily_tot.setdefault(tgl, {'tanggal': tgl, 'revenue': 0.0, 'profit': 0.0, 'transaksi': 0})
@@ -305,8 +300,7 @@ def process(orders, sku_items):
     def hourly_list(hm):
         return [{'hour': f'{h:02d}:00', 'revenue': round(hm.get(h, 0), 0)} for h in range(8, 23)]
 
-    basket_size = round(basket_rev / basket_txn, 0) if basket_txn else 0
-
+    
     # Revenue store menggunakan SKU report (paling akurat) di-scale ke total order
     s1_rev_final  = s1_rev_sku * scale
     s2_rev_final  = s2_rev_sku * scale
@@ -317,7 +311,7 @@ def process(orders, sku_items):
         'total_revenue':   round(tot_rev, 0),
         'total_profit':    round(tot_sku_prof * scale, 0),
         'total_transaksi': int(tot_txn),
-        'basket_size':     basket_size,
+        'basket_size':     basket_size_sku,
         'gpm_total':       gpm(tot_sku_prof, tot_sku_rev),
 
         'store1': {'name': 'Jl. Yos Sudarso IV',
