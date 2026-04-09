@@ -18,7 +18,7 @@ app = Flask(__name__)
 APP_ID     = os.environ.get('OLSERA_APP_ID', '')
 SECRET_KEY = os.environ.get('OLSERA_SECRET_KEY', '')
 BASE_URL_TOKEN = "https://api-open.olsera.co.id/api/open-api/v1/id"   # token pakai /id/
-BASE_URL_DATA  = "https://api-open.olsera.co.id/api/open-api/v1/en"   # data pakai /en/
+BASE_URL_DATA  = "https://api-open.olsera.co.id/api/open-api/v1/id"   # data pakai /id/
 
 _cache = {
     "weekly": None, "monthly": None,
