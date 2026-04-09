@@ -17,7 +17,8 @@ app = Flask(__name__)
 
 APP_ID     = os.environ.get('OLSERA_APP_ID', '')
 SECRET_KEY = os.environ.get('OLSERA_SECRET_KEY', '')
-BASE_URL   = "https://api-open.olsera.co.id/api/open-api/v1/id"
+BASE_URL_TOKEN = "https://api-open.olsera.co.id/api/open-api/v1/id"   # token pakai /id/
+BASE_URL_DATA  = "https://api-open.olsera.co.id/api/open-api/v1/en"   # data pakai /en/
 
 _cache = {
     "weekly": None, "monthly": None,
@@ -50,7 +51,7 @@ def get_token():
 
 def _generate_token():
     try:
-        r = requests.post(f"{BASE_URL}/token",
+        r = requests.post(f"{BASE_URL_TOKEN}/token",
             json={"app_id": APP_ID, "secret_key": SECRET_KEY, "grant_type": "secret_key"},
             timeout=30)
         r.raise_for_status()
@@ -81,13 +82,13 @@ def fetch_orders(start_date, end_date):
         params  = {"start_date": str(start_date), "end_date": str(end_date),
                    "page": page, "per_page": 100}
         try:
-            r = requests.get(f"{BASE_URL}/order/closeorder/list",
+            r = requests.get(f"{BASE_URL_DATA}/order/closeorder/list",
                              headers=headers, params=params, timeout=30)
             if r.status_code == 401:
                 token = _generate_token()
                 if not token: break
                 headers["Authorization"] = f"Bearer {token}"
-                r = requests.get(f"{BASE_URL}/order/closeorder/list",
+                r = requests.get(f"{BASE_URL_DATA}/order/closeorder/list",
                                  headers=headers, params=params, timeout=30)
             r.raise_for_status()
             data = r.json()
