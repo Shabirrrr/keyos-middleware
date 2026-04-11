@@ -412,15 +412,20 @@ def refresh_period(start_date, end_date):
     sku      = fetch_report_sku(start_date, end_date)
     return process(orders, sku)
 
+def week_start_sunday(d):
+    """Kembalikan hari Minggu (awal minggu) dari tanggal d."""
+    # weekday(): Mon=0 ... Sun=6 → shift ke Sun=0 Mon=1 ... Sat=6
+    days_since_sunday = (d.weekday() + 1) % 7
+    return d - timedelta(days=days_since_sunday)
+
 def refresh_all():
     if _cache['fetching']: return
     _cache['fetching'] = True
     try:
         today = date.today()
-        wday  = today.weekday()
-        ws  = today - timedelta(days=wday); we  = today
-        pws = ws - timedelta(days=7);       pwe = ws - timedelta(days=1)
-        ms  = today.replace(day=1);         me  = today
+        ws  = week_start_sunday(today); we  = today
+        pws = ws - timedelta(days=7);   pwe = ws - timedelta(days=1)
+        ms  = today.replace(day=1);     me  = today
         pms = (ms - timedelta(days=1)).replace(day=1); pme = ms - timedelta(days=1)
 
         print('[REFRESH] Starting v7 refresh...')
@@ -461,6 +466,45 @@ def api_dashboard():
             threading.Thread(target=refresh_all, daemon=True).start()
         return jsonify({'status': 'loading', 'message': 'Mengambil data, coba lagi dalam 60 detik'}), 503
     return jsonify(data)
+
+@app.route('/api/dashboard/custom')
+def api_dashboard_custom():
+    """
+    Fetch data untuk rentang tanggal custom.
+    Params: from=YYYY-MM-DD, to=YYYY-MM-DD, compare=true/false
+    """
+    from_str = request.args.get('from')
+    to_str   = request.args.get('to')
+    do_compare = request.args.get('compare', 'true').lower() == 'true'
+
+    if not from_str or not to_str:
+        return jsonify({'error': 'Parameter from dan to wajib diisi (YYYY-MM-DD)'}), 400
+
+    try:
+        start = date.fromisoformat(from_str)
+        end   = date.fromisoformat(to_str)
+    except ValueError:
+        return jsonify({'error': 'Format tanggal salah, gunakan YYYY-MM-DD'}), 400
+
+    if start > end:
+        return jsonify({'error': 'from harus sebelum to'}), 400
+
+    try:
+        curr = refresh_period(start, end)
+
+        prev = None
+        if do_compare:
+            delta      = (end - start) + timedelta(days=1)
+            prev_start = start - delta
+            prev_end   = start - timedelta(days=1)
+            prev       = refresh_period(prev_start, prev_end)
+
+        result = build_response(curr, prev)
+        result['date_range'] = {'from': str(start), 'to': str(end)}
+        return jsonify(result)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/status')
 def api_status():
